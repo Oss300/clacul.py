@@ -1,12 +1,15 @@
 
 
+
 """
 Calculadora de Tabla de Verdad + Procedimiento con Leyes Lógicas
 Ejecutar con:  streamlit run calculadora_completa.py
 """
+import heapq
 import html
 import itertools
 import re
+import time
 
 import pandas as pd
 import streamlit as st
@@ -453,8 +456,8 @@ def _factor_comun(n):
                 ra, rb = a[3 - xi], b[3 - yi]
                 if _complementarios(ra, rb) or _iguales(ra, rb):
                     return ((otro, x, (k, ra, rb)),
-                            f"Distributiva (p {SIMBOLO[otro]} q) {SIMBOLO[k]} "
-                            f"(p {SIMBOLO[otro]} r) ≡ p {SIMBOLO[otro]} (q {SIMBOLO[k]} r)")
+                            f"Distributiva ((p {SIMBOLO[otro]} q) {SIMBOLO[k]} "
+                            f"(p {SIMBOLO[otro]} r) ≡ p {SIMBOLO[otro]} (q {SIMBOLO[k]} r))")
 
 
 # --- Grupo 4: reagrupar para que dos términos queden juntos ----
@@ -485,23 +488,26 @@ GRUPOS = [
 
 
 def _buscar(nodo, reglas):
-    """Primera regla aplicable, recorriendo de adentro hacia afuera."""
+    """Primera regla aplicable, recorriendo de adentro hacia afuera.
+    Devuelve (nodo_nuevo, ley, parte_antes, parte_despues): la parte que cambió."""
     if nodo[0] not in ("var", "const"):
         for i in range(1, len(nodo)):
             r = _buscar(nodo[i], reglas)
             if r:
-                hijo, ley = r
-                return nodo[:i] + (hijo,) + nodo[i + 1:], ley
+                hijo, ley, antes, despues = r
+                return nodo[:i] + (hijo,) + nodo[i + 1:], ley, antes, despues
     for regla in reglas:
         r = regla(nodo)
         if r:
-            return r
+            return r[0], r[1], nodo, r[0]
     return None
 
 
-def derivar(arbol, max_pasos=80):
-    """Devuelve [(ley, nodo), ...]. El primer elemento es la original (ley=None)."""
-    pasos = [(None, arbol)]
+def derivar_detalle(arbol, max_pasos=80):
+    """Devuelve [(ley, nodo, antes, despues), ...]. El primer elemento es la
+    expresión original (ley=None). 'antes' y 'despues' son solo la parte de la
+    expresión sobre la que se aplicó la ley."""
+    pasos = [(None, arbol, None, None)]
     vistos = {arbol}
     actual = arbol
     for _ in range(max_pasos):
@@ -512,12 +518,230 @@ def derivar(arbol, max_pasos=80):
                 break
         if not r:
             break
-        actual, ley = r
+        actual, ley, antes, despues = r
         if actual in vistos:  # protección contra ciclos
             break
         vistos.add(actual)
-        pasos.append((ley, actual))
+        pasos.append((ley, actual, antes, despues))
     return pasos
+
+
+def derivar(arbol, max_pasos=80):
+    """Devuelve [(ley, nodo), ...]. El primer elemento es la original (ley=None)."""
+    return [(ley, nodo) for ley, nodo, _, _ in derivar_detalle(arbol, max_pasos)]
+
+
+# --- Búsqueda del camino más corto ------------------------------
+# derivar_detalle sigue un orden fijo (clásico: quitar flechas, mover
+# negaciones, simplificar). Aquí se prueban TODAS las formas de aplicar una ley
+# en cualquier parte y se elige la secuencia con menos pasos hasta el resultado.
+def _tamano(n):
+    return 1 if n[0] in ("var", "const") else 1 + sum(_tamano(h) for h in n[1:])
+
+
+def _objetivo(arbol):
+    """1 si es tautología, 0 si es contradicción, None si es contingencia."""
+    vs = variables(arbol)
+    if len(vs) > 8:
+        return None
+    r = [evaluar(arbol, dict(zip(vs, v))) for v in itertools.product([True, False], repeat=len(vs))]
+    if all(r):
+        return ("const", True)
+    if not any(r):
+        return ("const", False)
+    return None
+
+
+def _aplicaciones(nodo, g):
+    """Todas las formas de aplicar UNA ley del grupo g, en cualquier parte del nodo."""
+    if nodo[0] not in ("var", "const"):
+        for i in range(1, len(nodo)):
+            for hijo, ley, antes, despues in _aplicaciones(nodo[i], g):
+                yield nodo[:i] + (hijo,) + nodo[i + 1:], ley, antes, despues
+    for regla in GRUPOS[g]:
+        r = regla(nodo)
+        if r:
+            yield r[0], r[1], nodo, r[0]
+
+
+def derivar_corto(arbol, max_estados=4000, max_pasos=30, limite_seg=1.5):
+    """Camino con menos pasos (mismo formato que derivar_detalle).
+    Si la expresión es tautología/contradicción el destino es 1/0; si no, la
+    expresión más pequeña que se alcance. Un pequeño costo extra desempata a
+    favor de las leyes de simplificación sobre los reagrupamientos."""
+    objetivo = _objetivo(arbol)
+    inicio = _canon(arbol)
+    cont = itertools.count()
+    heap = [(0.0, 0, next(cont), arbol)]
+    dist = {inicio: 0.0}
+    padre = {inicio: None}
+    mejor = (_tamano(arbol), 0.0, inicio)
+    meta = None
+    expandidos = 0
+    tam_max = 3 * _tamano(arbol) + 10  # no explorar expresiones que se disparan de tamaño
+    limite = time.monotonic() + limite_seg
+    while heap and expandidos < max_estados and time.monotonic() < limite:
+        coste, pasos, _, nodo = heapq.heappop(heap)
+        clave = _canon(nodo)
+        if coste > dist[clave]:
+            continue  # entrada vieja: ya se llegó aquí por un camino mejor
+        if objetivo is not None and nodo == objetivo:
+            meta = clave
+            break
+        cand = (_tamano(nodo), coste, clave)
+        if cand[:2] < mejor[:2]:
+            mejor = cand
+        expandidos += 1
+        if pasos >= max_pasos:
+            continue
+        for g in range(len(GRUPOS)):
+            for nuevo, ley, antes, despues in _aplicaciones(nodo, g):
+                if _tamano(nuevo) > tam_max:
+                    continue
+                k = _canon(nuevo)
+                c = coste + 1 + 0.01 * g
+                if k not in dist or c < dist[k]:
+                    dist[k] = c
+                    padre[k] = (clave, ley, antes, despues, nuevo)
+                    heapq.heappush(heap, (c, pasos + 1, next(cont), nuevo))
+    meta = meta or mejor[2]
+    camino = []
+    k = meta
+    while padre[k] is not None:
+        previa, ley, antes, despues, nuevo = padre[k]
+        camino.append((ley, nuevo, antes, despues))
+        k = previa
+    return [(None, arbol, None, None)] + camino[::-1]
+
+
+def derivar_mejor(arbol):
+    """El camino más corto; si el clásico es igual de bueno, se queda con el clásico."""
+    clasico = derivar_detalle(arbol)
+    try:
+        corto = derivar_corto(arbol)
+    except Exception:  # por seguridad: nunca dejar sin respuesta
+        return clasico
+    tam_c, tam_k = _tamano(clasico[-1][1]), _tamano(corto[-1][1])
+    if tam_k < tam_c or (tam_k == tam_c and len(corto) < len(clasico)):
+        return corto
+    return clasico
+
+
+# ============================================================
+# 2b. REFERENCIA Y EXPLICACIÓN DE LAS LEYES
+# ============================================================
+# (nombre, equivalencias, qué dice, ejemplo)
+LEYES_REF = [
+    ("Condicional", "p → q ≡ ¬p ∨ q",
+     "Una implicación solo es falsa si p es verdadero y q falso, igual que ¬p ∨ q. "
+     "Sirve para eliminar la flecha.",
+     "(p → ¬q)  pasa a  (¬p ∨ ¬q)"),
+    ("Bicondicional", "p ↔ q ≡ (p → q) ∧ (q → p)",
+     "Es verdadero cuando ambos valen lo mismo: p implica q y q implica p.",
+     "p ↔ q  pasa a  (p → q) ∧ (q → p)"),
+    ("XOR", "p ⊕ q ≡ (p ∨ q) ∧ ¬(p ∧ q)",
+     "Es verdadero cuando al menos uno es verdadero, pero no los dos a la vez.",
+     "p ⊕ q  pasa a  (p ∨ q) ∧ ¬(p ∧ q)"),
+    ("Doble negación", "¬¬p ≡ p",
+     "Negar dos veces devuelve el valor original.",
+     "¬¬q  pasa a  q"),
+    ("De Morgan", "¬(p ∧ q) ≡ ¬p ∨ ¬q\n¬(p ∨ q) ≡ ¬p ∧ ¬q",
+     "Al negar un grupo, la negación entra en él y cambia ∧ por ∨ (o ∨ por ∧).",
+     "¬(p ∨ q)  pasa a  ¬p ∧ ¬q"),
+    ("Negación de constante", "¬1 ≡ 0\n¬0 ≡ 1",
+     "La negación de verdadero es falso y la de falso es verdadero.",
+     "¬1  pasa a  0"),
+    ("Identidad", "p ∧ 1 ≡ p\np ∨ 0 ≡ p",
+     "El elemento neutro no cambia nada: ∧ con 1 o ∨ con 0 deja la expresión igual.",
+     "q ∧ 1  pasa a  q"),
+    ("Dominación", "p ∨ 1 ≡ 1\np ∧ 0 ≡ 0",
+     "Una constante dominante fija todo el resultado: ∨ con 1 da 1 y ∧ con 0 da 0.",
+     "q ∨ 1  pasa a  1"),
+    ("Complemento", "p ∨ ¬p ≡ 1\np ∧ ¬p ≡ 0",
+     "Una expresión junto a su negación: con ∨ siempre da 1 y con ∧ siempre da 0.",
+     "q ∨ ¬q  pasa a  1"),
+    ("Idempotencia", "p ∧ p ≡ p\np ∨ p ≡ p",
+     "Repetir la misma expresión con ∧ o con ∨ no añade nada.",
+     "p ∨ p  pasa a  p"),
+    ("Absorción", "p ∨ (p ∧ q) ≡ p\np ∧ (p ∨ q) ≡ p",
+     "Si p aparece solo y también dentro del grupo con q, el grupo sobra y queda p.",
+     "p ∧ (p ∨ q)  pasa a  p"),
+    ("Absorción generalizada", "p ∨ (¬p ∧ q) ≡ p ∨ q\np ∧ (¬p ∨ q) ≡ p ∧ q",
+     "Si en el grupo aparece ¬p y p está afuera, se puede quitar ¬p del grupo.",
+     "p ∨ (¬p ∧ q)  pasa a  p ∨ q"),
+    ("Distributiva", "(p ∨ q) ∧ (p ∨ r) ≡ p ∨ (q ∧ r)\n(p ∧ q) ∨ (p ∧ r) ≡ p ∧ (q ∨ r)",
+     "Si dos grupos comparten el factor p, se saca p como factor común.",
+     "(p ∨ q) ∧ (p ∨ ¬q)  pasa a  p ∨ (q ∧ ¬q)"),
+    ("Asociativa", "(p ∧ q) ∧ r ≡ p ∧ (q ∧ r)\n(p ∨ q) ∨ r ≡ p ∨ (q ∨ r)",
+     "Con el mismo operador, cambiar los agrupadores no cambia el valor. Se usa para "
+     "juntar los términos que se van a simplificar.",
+     "(p ∨ q) ∨ ¬p  pasa a  q ∨ (p ∨ ¬p)"),
+    ("Conmutativa", "p ∧ q ≡ q ∧ p\np ∨ q ≡ q ∨ p",
+     "El orden de los términos con el mismo operador no cambia el valor.",
+     "p ∨ q ∨ ¬p  pasa a  q ∨ (p ∨ ¬p)"),
+]
+
+POR_QUE = {
+    "Bicondicional": "p ↔ q es verdadero cuando ambos valen lo mismo, es decir, cuando p implica q y q implica p.",
+    "XOR": "p ⊕ q es verdadero cuando al menos uno lo es, pero no los dos a la vez.",
+    "Condicional": "p → q solo es falso cuando p es verdadero y q falso, igual que ¬p ∨ q. Así se elimina la flecha.",
+    "Doble negación": "Negar dos veces devuelve el valor original, así que las dos negaciones se cancelan.",
+    "De Morgan": "Al negar un grupo, la negación entra en él y el operador cambia: ∧ pasa a ∨ y ∨ pasa a ∧.",
+    "Negación de constante": "La negación de 1 es 0 y la de 0 es 1.",
+    "Dominación": "Una constante dominante decide todo el resultado: ∨ con 1 da 1 y ∧ con 0 da 0.",
+    "Identidad": "El elemento neutro no cambia nada: ∧ con 1 o ∨ con 0 deja la expresión igual.",
+    "Complemento": "Una expresión junto a su negación: con ∨ siempre da 1 y con ∧ siempre da 0.",
+    "Idempotencia": "Repetir la misma expresión con ∧ o con ∨ no añade nada, así que basta una vez.",
+    "Absorción": "Como la expresión aparece sola y también dentro del grupo, el grupo sobra.",
+    "Absorción generalizada": "La expresión está afuera y su negación dentro del grupo; esa negación se puede quitar del grupo.",
+    "Distributiva": "Los dos grupos comparten un factor, así que se saca como factor común.",
+    "Asociativa": "Con el mismo operador, cambiar los agrupadores no cambia el valor. Se hace para juntar los términos que se van a simplificar.",
+    "Conmutativa y asociativa": "Se reordenan y reagrupan los términos del mismo operador para acercar los que se simplifican.",
+}
+
+
+def nombre_ley(ley):
+    """'Condicional (p → q ≡ ¬p ∨ q)' -> 'Condicional'."""
+    return ley.partition(" (")[0]
+
+
+def leyes_usadas(pasos):
+    """Nombres (de LEYES_REF) usados en una derivación, en orden de aparición."""
+    usadas = []
+    for paso in pasos[1:]:
+        nombre = nombre_ley(paso[0])
+        for n in (["Conmutativa", "Asociativa"] if nombre == "Conmutativa y asociativa" else [nombre]):
+            if n not in usadas:
+                usadas.append(n)
+    return usadas
+
+
+def explicar_paso(ley, antes, despues):
+    """Explicación en lenguaje sencillo de un paso del procedimiento."""
+    nombre = nombre_ley(ley)
+    return (f"En «{a_texto(antes)}» se aplica la ley «{nombre}». "
+            f"{POR_QUE.get(nombre, '')} Queda «{a_texto(despues)}».")
+
+
+def explicar_procedimiento(pasos, camino_corto=False):
+    """Resumen en una o dos frases de todo el procedimiento."""
+    n = len(pasos) - 1
+    if n == 0:
+        return "La expresión ya está simplificada: no se pudo aplicar ninguna ley."
+    leyes = leyes_usadas(pasos)
+    final = pasos[-1][1]
+    if final == ("const", True):
+        cierre = "El resultado es 1, así que la expresión es una tautología."
+    elif final == ("const", False):
+        cierre = "El resultado es 0, así que la expresión es una contradicción."
+    else:
+        cierre = f"La forma simplificada es «{a_texto(final)}»."
+    metodo = ("Se eligió el camino con menos pasos entre todas las leyes aplicables."
+              if camino_corto else
+              "Primero se eliminan ↔, ⊕ y →, luego se llevan las negaciones hacia adentro y "
+              "después se simplifica.")
+    return (f"Se necesitaron {n} paso{'s' if n != 1 else ''} usando: {', '.join(leyes)}. "
+            f"{metodo} {cierre}")
 
 
 # ============================================================
@@ -595,11 +819,24 @@ div[data-testid="stTextInput"] input:focus{border-color:#6366f1;box-shadow:0 0 0
 .step.final.neu{border-color:#6366f1;background:rgba(99,102,241,.1)}
 .vacio-res{text-align:center;padding:3rem 1rem;opacity:.6;border:2px dashed rgba(127,127,127,.35);
   border-radius:18px}
+.expl{margin-top:.5rem;font-size:.93rem;line-height:1.5;padding:.5rem .8rem;border-radius:10px;
+  background:rgba(245,158,11,.12);border-left:4px solid #f59e0b}
+.resumen{margin:.4rem 0 1rem;padding:.8rem 1rem;border-radius:14px;background:rgba(99,102,241,.1);
+  border:1px solid rgba(99,102,241,.3);line-height:1.5}
+.ref{width:100%;border-collapse:separate;border-spacing:0;border:1px solid rgba(127,127,127,.3);
+  border-radius:14px;overflow:hidden}
+.ref th{background:rgba(99,102,241,.2);text-align:left;padding:.65rem .85rem;font-size:.95rem}
+.ref td{padding:.65rem .85rem;border-top:1px solid rgba(127,127,127,.2);vertical-align:top;font-size:.95rem}
+.ref .eq{font-family:ui-monospace,Consolas,Menlo,monospace;white-space:pre-line}
+.ref tr.usada td{background:rgba(16,185,129,.13)}
+.ref tr.usada td:first-child{box-shadow:inset 4px 0 0 #10b981}
+.ref .marca{display:inline-block;margin-left:.4rem;padding:.05rem .5rem;border-radius:999px;
+  font-size:.75rem;background:rgba(16,185,129,.25);color:#059669;font-weight:700}
 </style>
 """
 
 
-def _tarjeta(n, expr, ley=None, clase=""):
+def _tarjeta(n, expr, ley=None, clase="", explicacion=None):
     ley_html = ""
     if ley:
         nombre, _, formula = ley.partition(" (")
@@ -608,12 +845,32 @@ def _tarjeta(n, expr, ley=None, clase=""):
         ley_html = (f'<span class="ley"><b>{html.escape(nombre)}</b>'
                     + (f' &nbsp;<code>{html.escape(formula)}</code>' if formula else "")
                     + "</span>")
-    return (f'<div class="step {clase}"><div class="n">{n}</div><div>'
-            f'<div class="expr">{html.escape(expr)}</div>{ley_html}</div></div>')
+    expl_html = f'<div class="expl">💡 {html.escape(explicacion)}</div>' if explicacion else ""
+    return (f'<div class="step {clase}"><div class="n">{n}</div><div style="flex:1">'
+            f'<div class="expr">{html.escape(expr)}</div>{ley_html}{expl_html}</div></div>')
 
 
-def mostrar_procedimiento(arbol, original):
-    pasos = derivar(arbol)
+def tabla_referencia(usadas=()):
+    """Tabla fija: cada ley con las expresiones a las que se aplica.
+    Las leyes usadas en el ejercicio actual salen resaltadas."""
+    filas = []
+    for nombre, equiv, significado, ejemplo in LEYES_REF:
+        es_usada = nombre in usadas
+        marca = '<span class="marca">usada</span>' if es_usada else ""
+        filas.append(
+            f'<tr class="{"usada" if es_usada else ""}">'
+            f'<td><b>{html.escape(nombre)}</b>{marca}</td>'
+            f'<td class="eq">{html.escape(equiv)}</td>'
+            f'<td>{html.escape(significado)}</td>'
+            f'<td class="eq">{html.escape(ejemplo)}</td></tr>')
+    return ('<table class="ref"><thead><tr><th>Ley</th><th>Expresiones que cubre</th>'
+            '<th>¿Qué dice?</th><th>Ejemplo</th></tr></thead><tbody>'
+            + "".join(filas) + "</tbody></table>")
+
+
+def mostrar_procedimiento(arbol, original, explicar=True, camino_corto=False):
+    detalle = derivar_mejor(arbol) if camino_corto else derivar_detalle(arbol)
+    pasos = [(ley, nodo) for ley, nodo, _, _ in detalle]
     final = pasos[-1][1]
     if final == ("const", True):
         clase_final = "ok"
@@ -622,13 +879,20 @@ def mostrar_procedimiento(arbol, original):
     else:
         clase_final = "neu"
 
+    if explicar:
+        st.markdown(f'<div class="resumen">🧭 <b>Resumen:</b> '
+                    f'{html.escape(explicar_procedimiento(pasos, camino_corto))}</div>',
+                    unsafe_allow_html=True)
+
     tarjetas = []
-    for i, (ley, nodo) in enumerate(pasos):
+    for i, (ley, nodo, antes, despues) in enumerate(detalle):
         if i == 0:
             tarjetas.append(_tarjeta(0, original, "Expresión original", "orig"))
         else:
-            es_ultimo = i == len(pasos) - 1
-            tarjetas.append(_tarjeta(i, a_texto(nodo), ley, f"final {clase_final}" if es_ultimo else ""))
+            es_ultimo = i == len(detalle) - 1
+            expl = explicar_paso(ley, antes, despues) if explicar else None
+            tarjetas.append(_tarjeta(i, a_texto(nodo), ley,
+                                     f"final {clase_final}" if es_ultimo else "", expl))
     st.markdown("".join(tarjetas), unsafe_allow_html=True)
 
     if final == ("const", True):
@@ -764,6 +1028,8 @@ def main():
 
         teclado()
         mostrar_pasos = st.checkbox("Mostrar subexpresiones en la tabla de verdad", value=True)
+        explicar = st.checkbox("💡 Explicar cada paso del procedimiento", value=True)
+        corto = st.checkbox("⚡ Buscar el camino más corto (si no, método clásico fijo)", value=True)
 
         if st.button("🚀  Resolver", key="resolver"):
             if not texto:
@@ -776,6 +1042,7 @@ def main():
                 st.button(expr, key=f"ej_{i}", help=desc, on_click=cargar, args=(expr,))
 
     # ---------------- Columna derecha: resultados ----------------
+    usadas = []  # leyes usadas en el ejercicio actual (se resaltan en la tabla fija)
     with der:
         calc = st.session_state.calc
         if not calc:
@@ -799,10 +1066,20 @@ def main():
                             f'<div class="chips"><span class="badge {tipo[0]}">{tipo[1]}</span>{vars_html}</div>',
                             unsafe_allow_html=True)
                 tab_leyes, tab_tabla = st.tabs(["📐 Procedimiento", "📊 Tabla de verdad"])
+                camino = derivar_mejor(arbol) if corto else derivar_detalle(arbol)
+                usadas = leyes_usadas(camino)
                 with tab_leyes:
-                    mostrar_procedimiento(arbol, original)
+                    mostrar_procedimiento(arbol, original, explicar, corto)
                 with tab_tabla:
                     mostrar_tabla(arbol, mostrar_pasos)
+
+    # ---------------- Tabla fija de referencia de leyes ----------------
+    st.markdown("---")
+    st.subheader("📖 Tabla de referencia de leyes lógicas")
+    st.caption("Qué expresiones cubre cada ley. Las leyes que se usaron en tu ejercicio "
+               "aparecen resaltadas en verde." if usadas else
+               "Qué expresiones cubre cada ley. Al resolver un ejercicio se resaltan las que usó.")
+    st.markdown(tabla_referencia(usadas), unsafe_allow_html=True)
 
     st.markdown("---")
     g1, g2 = st.columns(2)
